@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Attendance Kiosk</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
+  html, body {
+    height: 100%; width: 100%; overflow: hidden;
+    font-family: 'Segoe UI', Roboto, sans-serif;
+    background: #0f172a;
+    color: white;
+  }
+  #idleScreen {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100vh; text-align: center; padding: 20px;
+  }
+  #idleScreen h1 { font-size: 8vw; margin-bottom: 10px; }
+  #idleScreen p { font-size: 4vw; opacity: 0.7; }
+  #startBtn {
+    margin-top: 30px; padding: 20px 50px; font-size: 5vw;
+    background: #2563eb; color: white; border: none; border-radius: 12px;
+  }
+  #camPreview {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    object-fit: cover; display: none; z-index: 5; transform: scaleX(-1);
+  }
+  #resultScreen {
+    display: none; position: fixed; top:0; left:0; width:100%; height:100%;
+    flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; z-index: 10; padding: 20px; cursor: pointer;
+  }
+  #resultScreen.success { background: #16a34a; }
+  #resultScreen.error { background: #dc2626; }
+  #resultScreen h2 { font-size: 6vw; padding: 0 20px; }
+  #resultScreen .hint { font-size: 3vw; opacity: 0.8; margin-top: 20px; }
+  .pulse { animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
+
+  #debugToggle {
+    position: fixed; bottom: 10px; right: 10px; z-index: 30;
+    width: 36px; height: 36px; border-radius: 50%;
+    background: rgba(255,255,255,0.15); color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+  }
+  #debugPanel {
+    display: none; position: fixed; bottom: 0; left: 0; width: 100%;
+    max-height: 40vh; overflow-y: auto; z-index: 30;
+    background: rgba(0,0,0,0.9); color: #4ade80;
+    font-family: monospace; font-size: 12px; padding: 10px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+</style>
+</head>
+<body>
+
+  <div id="idleScreen">
+    <h1 class="pulse" id="idleTitle">📶 Tap Your Card</h1>
+    <p id="idleSub">Hold your ID near the back of the tablet</p>
+    <button id="startBtn" onclick="startScanning()">Start Scanning</button>
+  </div>
+
+  <video id="camPreview" autoplay playsinline muted></video>
+
+  <div id="resultScreen" onclick="dismissResult()">
+    <h2 id="resultText"></h2>
+    <div class="hint" id="resultHint"></div>
+  </div>
+
+  <div id="debugToggle" onclick="toggleDebug()">🐞</div>
+  <div id="debugPanel"></div>
+
+  <script>
+    // ============================================================
+    // CONFIG — fill these in
+    // ============================================================
+    // Your Apps Script web app /exec URL (deploy Code.gs as a Web App).
+    const SCRIPT_URL = "https://script.google.com/a/macros/suds.com.ph/s/AKfycbzbjJoa0eSKEEkc3z0Vvh41MN2WqYUpKvc2psfrkdBglNUPh3xLsiGXSY_VX19XAAOv/exec";
+
+    // Read device/branch from this page's own URL, e.g.:
+    // https://your-static-host.example/index.html?device=TOKEN&branch=Main
+    const params = new URLSearchParams(location.search);
+    const DEVICE_ID = params.get('device') || '';
+    const BRANCH = params.get('branch') || '';
+
+    let processing = false;
+    let resultTimer = null;
+    const CAPTURE_TIMEOUT_MS = 5000; // must capture the selfie within 5s of the tap
+
+    function dlog(msg) {
+      const panel = document.getElementById('debugPanel');
+      const line = document.createElement('div');
+      const time = new Date().toLocaleTimeString();
+      line.textContent = '[' + time + '] ' + msg;
+      panel.appendChild(line);
+      panel.scrollTop = panel.scrollHeight;
+      console.log(msg);
+    }
+    function toggleDebug() {
+      const panel = document.getElementById('debugPanel');
+      panel.style.display = (panel.style.display === 'block') ? 'none' : 'block';
+    }
+
+    async function startScanning() {
+      if (!DEVICE_ID) {
+        showResult(false, 'Missing ?device= in the page URL.');
+        return;
+      }
+      document.getElementById('startBtn').style.display = 'none';
+      document.getElementById('idleSub').textContent = 'Requesting camera permission…';
+      await primeCameraPermission();
+
+      document.getElementById('idleSub').textContent = 'Requesting NFC permission…';
+      const nfcOk = await startNFC();
+
+      if (nfcOk) {
+        document.getElementById('idleTitle').textContent = '📶 Tap Your Card';
+        document.getElementById('idleSub').textContent = 'Hold your ID near the back of the tablet';
+        dlog('Ready. Waiting for NFC tap.');
+      } else {
+        document.getElementById('idleTitle').textContent = '⚠️ NFC unavailable';
+      }
+    }
+
+    function primeCameraPermission() {
+      return new Promise(async function(resolve) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+          stream.getTracks().forEach(function(t) { t.stop(); });
+          dlog('Camera permission primed OK.');
+        } catch (err) {
+          dlog('Camera priming failed: ' + err.name + ' - ' + err.message);
+        }
+        resolve();
+      });
+    }
+
+    async function startNFC() {
+      if (!('NDEFReader' in window)) {
+        showResult(false, 'NFC not supported on this device/browser. Use Chrome on Android.');
+        return false;
+      }
+      try {
+        const reader = new NDEFReader();
+        await reader.scan();
+        reader.onreading = function(event) {
+          dlog('NFC tag read.');
+          if (processing) { dlog('Ignored tap — already processing.'); return; }
+          try {
+            const record = event.message.records[0];
+            const staffId = new TextDecoder().decode(record.data);
+            dlog('Decoded staffId: ' + staffId);
+            handleTap(staffId);
+          } catch (err) {
+            dlog('Failed to decode NFC record: ' + err.message);
+            showResult(false, 'Could not read card data.');
+          }
+        };
+        reader.onreadingerror = function() {
+          dlog('NFC reading error event.');
+          showResult(false, 'Could not read card. Try again.');
+        };
+        dlog('NFC scan session active.');
+        return true;
+      } catch (err) {
+        dlog('NFC scan() failed: ' + err.name + ' - ' + err.message);
+        showResult(false, 'NFC permission denied or unavailable: ' + err.message);
+        return false;
+      }
+    }
+
+    async function handleTap(staffId) {
+      processing = true;
+      document.getElementById('idleTitle').textContent = '📸 Look at the camera…';
+      document.getElementById('idleSub').textContent = '';
+      try {
+        dlog('Starting selfie capture (5s budget)…');
+        const photoBase64 = await captureSelfie();
+        dlog('Selfie captured OK (' + Math.round(photoBase64.length / 1024) + ' KB).');
+
+        const timestamp = new Date().toISOString();
+
+        dlog('Sending to server…');
+        const result = await sendToServer(staffId, photoBase64, timestamp);
+        dlog('Server responded: ' + JSON.stringify(result));
+        showResult(result.success, result.message);
+        resetToIdle();
+      } catch (err) {
+        dlog('handleTap failed: ' + err.name + ' - ' + err.message);
+        showResult(false, err.message);
+        resetToIdle();
+      }
+    }
+
+    async function sendToServer(staffId, photoBase64, timestamp) {
+      // text/plain avoids a CORS preflight, which Apps Script doGet/doPost
+      // does not handle. The backend parses the body as JSON itself.
+      const res = await fetch(SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          staffId: staffId,
+          photoBase64: photoBase64,
+          timestamp: timestamp,
+          deviceId: DEVICE_ID
+        })
+      });
+      if (!res.ok) {
+        throw new Error('Server error (HTTP ' + res.status + ').');
+      }
+      return await res.json();
+    }
+
+    // ---- Live front-camera capture, capped at CAPTURE_TIMEOUT_MS total ----
+    function captureSelfie() {
+      return Promise.race([
+        captureSelfieAttempts(),
+        new Promise(function(_, reject) {
+          setTimeout(function() { reject(new Error('Capture timed out (5s).')); }, CAPTURE_TIMEOUT_MS);
+        })
+      ]);
+    }
+
+    function captureSelfieAttempts() {
+      return new Promise(async function(resolve, reject) {
+        const MAX_ATTEMPTS = 2;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          try {
+            dlog('getUserMedia attempt ' + attempt + '…');
+            const video = document.getElementById('camPreview');
+            const stream = await navigator.mediaDevices.getUserMedia({
+              video: { facingMode: 'user' }
+            });
+            video.srcObject = stream;
+            video.style.display = 'block';
+
+            await new Promise(function(res) {
+              if (video.readyState >= 1 && video.videoWidth > 0) return res();
+              video.onloadedmetadata = function() { res(); };
+              setTimeout(res, 1000);
+            });
+
+            await video.play();
+            dlog('Camera live (' + video.videoWidth + 'x' + video.videoHeight + ').');
+
+            if (!video.videoWidth || !video.videoHeight) {
+              throw new Error('Video has no dimensions — camera frame not ready.');
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+
+            stream.getTracks().forEach(function(t) { t.stop(); });
+            video.style.display = 'none';
+            return resolve(dataUrl);
+          } catch (err) {
+            dlog('Capture attempt ' + attempt + ' failed: ' + err.name + ' - ' + err.message);
+            document.getElementById('camPreview').style.display = 'none';
+            if (attempt === MAX_ATTEMPTS) {
+              return reject(err);
+            }
+            await new Promise(function(res) { setTimeout(res, 300); });
+          }
+        }
+      });
+    }
+
+    function resetToIdle() {
+      processing = false;
+      document.getElementById('idleTitle').textContent = '📶 Tap Your Card';
+      document.getElementById('idleSub').textContent = 'Hold your ID near the back of the tablet';
+    }
+
+    function showResult(success, message) {
+      const screen = document.getElementById('resultScreen');
+      screen.className = success ? 'success' : 'error';
+      document.getElementById('resultText').textContent = (success ? '✅ ' : '⚠️ ') + message;
+      document.getElementById('resultHint').textContent = success ? '' : 'Tap anywhere to dismiss';
+      screen.style.display = 'flex';
+      if (resultTimer) clearTimeout(resultTimer);
+      resultTimer = setTimeout(function() {
+        screen.style.display = 'none';
+      }, success ? 2500 : 6000);
+    }
+
+    function dismissResult() {
+      document.getElementById('resultScreen').style.display = 'none';
+      if (resultTimer) clearTimeout(resultTimer);
+    }
+  </script>
+
+</body>
+</html>
